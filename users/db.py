@@ -1,5 +1,6 @@
 from sqlalchemy import (
-    MetaData, Table, Column, ForeignKey, Integer, String, Boolean
+    MetaData, Table, Column, ForeignKey, Integer, String, Boolean,
+    UniqueConstraint
 )
 from sqlalchemy_utils import EmailType
 
@@ -11,6 +12,7 @@ users_friends_association = Table(
 
     Column('first_id', ForeignKey('users.id', ondelete='CASCADE')),
     Column('second_id', ForeignKey('users.id', ondelete='CASCADE')),
+    UniqueConstraint('first_id', 'second_id'),
 )
 
 users = Table(

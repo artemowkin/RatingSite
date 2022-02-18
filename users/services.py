@@ -1,11 +1,12 @@
-from typing import Optional
+from typing import Optional, Union
 import re
 
 import jwt
 from passlib.hash import pbkdf2_sha256
+from aiohttp.web import Request
 
 from ratingsite.settings import config
-from .db import users
+from .db import users, users_friends_association
 
 
 class BaseAuthService:
@@ -57,6 +58,15 @@ class RegistrationService(BaseAuthService):
         validation_errors.update(self._validate_email(data))
         return validation_errors
 
+    async def _create_db_user(self, conn, auth_data: dict) -> int:
+        """Create a new entry in DB and return new user id"""
+        del auth_data['password2']
+        password = pbkdf2_sha256.hash(auth_data.pop('password1'))
+        query = users.insert().values(password=password, **auth_data)
+        cursor = await conn.execute(query)
+        created_user_id = await cursor.fetchone()[0]
+        return created_user_id
+
     async def registrate_user(self, conn, auth_data: dict) -> dict:
         """
         Registrate user: create the user entry in DB and the JWT token,
@@ -64,10 +74,8 @@ class RegistrationService(BaseAuthService):
         """
         errors = self._validate_reg_data(auth_data)
         if errors: return errors
-        del auth_data['password2']
-        password = pbkdf2_sha256.hash(auth_data.pop('password1'))
-        query = users.insert().values(password=password, **auth_data)
-        cursor = await conn.execute(query)
+        created_user_id = await self._create_db_user(conn, auth_data)
+        auth_data.update({'id': created_user_id})
         jwt_token = jwt.encode(auth_data, config['jwt_secret'])
         return {'jwt_token': jwt_token}
 
@@ -93,9 +101,9 @@ class LoginService(BaseAuthService):
 
     def _create_jwt_token(self, user) -> str:
         """Create a new JWT token for user"""
-        jwt_user = dict(
-            zip(('email', 'nickname'), (user.email, user.nickname))
-        )
+        jwt_user = {
+            'id': user.id, 'email': user.email, 'nickname': user.nickname
+        }
         jwt_token = jwt.encode(jwt_user, config['jwt_secret'])
         return jwt_token
 
@@ -110,3 +118,67 @@ class LoginService(BaseAuthService):
         if not user: return {'error': "User with this email doesn't exist"}
         jwt_token = self._create_jwt_token(user)
         return {'jwt_token': jwt_token}
+
+
+def users_to_json(users_list: list) -> list[dict]:
+    """Format users entries from DB to list of dicts"""
+    json_users = [dict(user) for user in users_list]
+    for user in json_users:
+        del user['password']
+        del user['disabled']
+
+    return json_users
+
+
+async def get_all_users(conn, current_user=None) -> dict:
+    """Get all users from DB exclude current user (if not empty)"""
+    query = users.select().where(users.c.disabled == False)
+    if current_user:
+        query = query.where(users.c.email != current_user['email'])
+
+    cursor = await conn.execute(query)
+    all_users = await cursor.fetchall()
+    return users_to_json(all_users)
+
+
+async def add_user_friend(conn, request: Request) -> None:
+    """Add the user to friends list of current user"""
+    json_request = await request.json()
+    friend_id = json_request.get('id')
+    if not friend_id or request.user['id'] == friend_id: return
+    query = users_friends_association.insert({
+        'first_id': request.user['id'], 'second_id': friend_id
+    })
+    await conn.execute(query)
+
+
+class GetUserFriendsService:
+
+    def _get_user_friends_query(self, user_id: Union[str, int]):
+        """Construct get user friends query"""
+        return users.select().join(
+            users_friends_association,
+            users_friends_association.c.second_id == users.c.id
+        ).where(
+            users_friends_association.c.first_id == user_id
+        ).intersect(users.select().join(
+            users_friends_association,
+            users_friends_association.c.first_id == users.c.id
+        ).where(
+            users_friends_association.c.second_id == user_id
+        ))
+
+    def _format_friends_to_json(self, friends: list) -> list[dict]:
+        """Format friends list from DB to JSON"""
+        construct_lambda = lambda user: {
+            'id': user.id, 'email': user.email, 'nickname': user.nickname
+        }
+        return list(map(construct_lambda, friends))
+
+    async def get_friends(self, conn, user_id: Union[str, int]) -> list[dict]:
+        """Get user friends"""
+        query = self._get_user_friends_query(user_id)
+        cursor = await conn.execute(query)
+        user_friends = await cursor.fetchall()
+        json_user_friends = self._format_friends_to_json(user_friends)
+        return json_user_friends
