@@ -3,7 +3,7 @@ from psycopg2.errors import UniqueViolation, ForeignKeyViolation
 
 from .services import (
     RegistrationService, LoginService, get_all_users, add_user_friend,
-    GetUserFriendsService
+    GetUserFriendsService, get_user_info, GetAnotherUserInfoService
 )
 
 
@@ -77,3 +77,26 @@ async def get_user_friends(request):
             )
 
     return json_response(user_friends)
+
+
+@user_required
+async def current_user_info(request):
+    async with request.app['db'].acquire() as conn:
+        user_info = await get_user_info(conn, request.user['id'])
+
+    return json_response(user_info)
+
+
+async def another_user_info(request):
+    current_user_id = request.user['id']
+    another_user_id = request.match_info['user_id']
+    async with request.app['db'].acquire() as conn:
+        info_service = GetAnotherUserInfoService(conn, current_user_id)
+        try:
+            another_user_info = await info_service.get_info(another_user_id)
+        except IndexError:
+            return json_response(
+                {'error': "User with this ID doesn't exist"}, status=400
+            )
+
+    return json_response(another_user_info)

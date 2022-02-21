@@ -4,8 +4,10 @@ import re
 import jwt
 from passlib.hash import pbkdf2_sha256
 from aiohttp.web import Request
+from sqlalchemy import and_
 
 from ratingsite.settings import config
+from ratings.services import GetUserRatingService
 from .db import users, users_friends_association
 
 
@@ -94,7 +96,9 @@ class LoginService(BaseAuthService):
 
     async def _get_user(self, conn, email: str):
         """Get user by email"""
-        query = users.select().where(users.c.email == email)
+        query = users.select().where(
+            and_(users.c.email == email, users.c.disabled == False)
+        )
         cursor = await conn.execute(query)
         user = await cursor.fetchone()
         return user
@@ -182,3 +186,36 @@ class GetUserFriendsService:
         user_friends = await cursor.fetchall()
         json_user_friends = self._format_friends_to_json(user_friends)
         return json_user_friends
+
+
+async def get_user_info(conn, user_id: Union[str, int]) -> dict:
+    """Get information (id, nickname, is_superuser, friends) about user"""
+    get_user_query = users.select().where(users.c.id == user_id)
+    cursor = await conn.execute(get_user_query)
+    user = await cursor.fetchone()
+    if not user: raise IndexError
+    json_user = {
+        'id': user.id, 'nickname': user.nickname,
+        'is_superuser': user.is_superuser
+    }
+    get_friends_service = GetUserFriendsService()
+    user_friends = await get_friends_service.get_friends(conn, user_id)
+    json_user['friends'] = user_friends
+    return json_user
+
+
+class GetAnotherUserInfoService:
+
+    def __init__(self, conn, current_user_id: Union[str, int]) -> None:
+        self._conn = conn
+        self._current_user_id = current_user_id
+
+    async def get_info(self, another_user_id: Union[str, int]) -> dict:
+        """Get full info (including friends and rating) about another user"""
+        user_info = await get_user_info(self._conn, another_user_id)
+        rating_service = GetUserRatingService(
+            self._conn, self._current_user_id
+        )
+        user_rating = await rating_service.get_user_rating(another_user_id)
+        user_info['rating'] = user_rating
+        return user_info
