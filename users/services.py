@@ -9,129 +9,16 @@ from sqlalchemy import and_
 from ratingsite.settings import config
 from ratings.services import GetUserRatingService
 from .db import users, users_friends_association
+from .serializers import RegistrationData, LoginData, UserSerializer
 
 
-class BaseAuthService:
-    """
-    Base service for authentication services with generic
-    validation methods
-    """
-
-    required_fields = tuple()
-
-    def _validate_email(self, data: dict) -> dict:
-        """Validate is email correct"""
-        regex = r"[^@]+@[^@]+\.[^@]+"
-        if 'email' in data and not re.match(regex, data['email']):
-            return {'email': 'incorrect email'}
-
-        return {}
-
-    def _validate_data_fields(self, data: dict) -> dict:
-        """Validate fields in data"""
-        errors = {}
-        err_msg = '{field} is required'
-        for field in self.required_fields:
-            if not field in data:
-                errors[field] = err_msg.format(field=field)
-
-        return errors
-
-
-class RegistrationService(BaseAuthService):
-    """Service with registration logic"""
-
-    required_fields = ('password1', 'password2', 'email', 'nickname')
-
-    def _validate_passwords_equal(self, data: dict) -> dict:
-        """Validate are passwords equal"""
-        if ('password1' in data and 'password2' in data and
-                data['password1'] != data['password2']):
-            return {'password2': 'passwords are not equal'}
-
-        return {}
-
-    def _validate_reg_data(self, data: dict) -> dict:
-        """Validate is registration data valid"""
-        validation_errors = {}
-        validation_errors.update(self._validate_data_fields(data))
-        validation_errors.update(self._validate_data_fields(data))
-        validation_errors.update(self._validate_passwords_equal(data))
-        validation_errors.update(self._validate_email(data))
-        return validation_errors
-
-    async def _create_db_user(self, conn, auth_data: dict) -> int:
-        """Create a new entry in DB and return new user id"""
-        del auth_data['password2']
-        password = pbkdf2_sha256.hash(auth_data.pop('password1'))
-        query = users.insert().values(password=password, **auth_data)
-        cursor = await conn.execute(query)
-        created_user_id = await cursor.fetchone()[0]
-        return created_user_id
-
-    async def registrate_user(self, conn, auth_data: dict) -> dict:
-        """
-        Registrate user: create the user entry in DB and the JWT token,
-        return the created jwt token, error data
-        """
-        errors = self._validate_reg_data(auth_data)
-        if errors: return errors
-        created_user_id = await self._create_db_user(conn, auth_data)
-        auth_data.update({'id': created_user_id})
-        jwt_token = jwt.encode(auth_data, config['jwt_secret'])
-        return {'jwt_token': jwt_token}
-
-
-class LoginService(BaseAuthService):
-    """Service with log in logic"""
-
-    required_fields = ('email', 'password')
-
-    def _validate_login_data(self, data: dict) -> dict:
-        """Validate fields in login data"""
-        validation_errors = {}
-        validation_errors.update(self._validate_data_fields(data))
-        validation_errors.update(self._validate_email(data))
-        return validation_errors
-
-    async def _get_user(self, conn, email: str):
-        """Get user by email"""
-        query = users.select().where(
-            and_(users.c.email == email, users.c.disabled == False)
-        )
-        cursor = await conn.execute(query)
-        user = await cursor.fetchone()
-        return user
-
-    def _create_jwt_token(self, user) -> str:
-        """Create a new JWT token for user"""
-        jwt_user = {
-            'id': user.id, 'email': user.email, 'nickname': user.nickname
-        }
-        jwt_token = jwt.encode(jwt_user, config['jwt_secret'])
-        return jwt_token
-
-    async def login_user(self, conn, auth_data: dict) -> dict:
-        """
-        Get user from db by `auth_data` and create a new JWT token
-        for it
-        """
-        errors = self._validate_login_data(auth_data)
-        if errors: return errors
-        user = await self._get_user(conn, auth_data['email'])
-        if not user: return {'error': "User with this email doesn't exist"}
-        jwt_token = self._create_jwt_token(user)
-        return {'jwt_token': jwt_token}
-
-
-def users_to_json(users_list: list) -> list[dict]:
-    """Format users entries from DB to list of dicts"""
-    json_users = [dict(user) for user in users_list]
-    for user in json_users:
-        del user['password']
-        del user['disabled']
-
-    return json_users
+async def get_user_by_nickname(conn, nickname: str):
+    """Get user from DB using nickname"""
+    query = users.select().where(users.c.nickname == nickname)
+    cursor = await conn.execute(query)
+    user = await cursor.fetchone()
+    if not user: raise IndexError
+    return user
 
 
 async def get_all_users(conn, current_user=None) -> dict:
@@ -142,7 +29,10 @@ async def get_all_users(conn, current_user=None) -> dict:
 
     cursor = await conn.execute(query)
     all_users = await cursor.fetchall()
-    return users_to_json(all_users)
+    json_users = [
+        UserSerializer.parse_obj(dict(user)).dict() for user in all_users
+    ]
+    return json_users
 
 
 async def add_user_friend(conn, request: Request) -> None:
@@ -156,9 +46,100 @@ async def add_user_friend(conn, request: Request) -> None:
     await conn.execute(query)
 
 
+async def get_user_info(conn, user_nickname: str) -> dict:
+    """Get information (id, nickname, is_superuser, friends) about user"""
+    user = await get_user_by_nickname(conn, user_nickname)
+    json_user = UserSerializer.parse_obj(dict(user)).dict()
+    get_friends_service = GetUserFriendsService(conn)
+    user_friends = await get_friends_service.get_friends_by_id(user.id)
+    json_user['friends'] = user_friends
+    return json_user
+
+
+class RegistrationService:
+    """Service with registration logic"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def _get_query_data(self, auth_data: RegistrationData) -> dict:
+        """
+        Get data for query with password field with hashed password
+        instead of password1 and password2 fields
+        """
+        password = pbkdf2_sha256.hash(auth_data.password1)
+        query_data = auth_data.dict(exclude={'password1', 'password2'})
+        query_data['password'] = password
+        return query_data
+
+    async def _create_db_user(self, auth_data: RegistrationData) -> int:
+        """Create a new entry in DB and return new user id"""
+        auth_data_dict = self._get_query_data(auth_data)
+        query = users.insert().values(**auth_data_dict)
+        cursor = await self._conn.execute(query)
+        created_user_id = await cursor.fetchone()
+        return created_user_id[0]
+
+    async def _get_jwt_token(self, auth_data: RegistrationData,
+            user_id: int) -> str:
+        """Generate jwt token for user"""
+        jwt_payload = auth_data.dict(include={'nickname', 'email'})
+        jwt_payload.update({'id': created_user_id})
+        jwt_token = jwt.encode(jwt_payload, config['jwt_secret'])
+        return jwt_token
+
+    async def registrate_user(self, auth_data: RegistrationData) -> dict:
+        """
+        Registrate user: create the user entry in DB and the JWT token,
+        return the created jwt token, error data
+        """
+        created_user_id = await self._create_db_user(auth_data)
+        jwt_token = self._get_jwt_token(auth_data, created_user_id)
+        return {'jwt_token': jwt_token}
+
+
+class LoginService:
+    """Service with log in logic"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def _get_user(self, email: str):
+        """Get user by email"""
+        query = users.select().where(
+            and_(users.c.email == email, users.c.disabled == False)
+        )
+        cursor = await self._conn.execute(query)
+        user = await cursor.fetchone()
+        return user
+
+    def _create_jwt_token(self, user) -> str:
+        """Create a new JWT token for user"""
+        jwt_payload = {
+            'id': user.id, 'email': user.email, 'nickname': user.nickname
+        }
+        jwt_token = jwt.encode(jwt_payload, config['jwt_secret'])
+        return jwt_token
+
+    async def login_user(self, auth_data: LoginData) -> dict:
+        """
+        Get user from db by `auth_data` and create a new JWT token
+        for it
+        """
+        user = await self._get_user(auth_data.email)
+        if not user: return {
+            'error': "User with these credentials doesn't exist"
+        }
+        jwt_token = self._create_jwt_token(user)
+        return {'jwt_token': jwt_token}
+
+
 class GetUserFriendsService:
 
-    def _get_user_friends_query(self, user_id: Union[str, int]):
+    def __init__(self, conn):
+        self._conn = conn
+
+    def _get_user_friends_query(self, user_id: int):
         """Construct get user friends query"""
         return users.select().join(
             users_friends_association,
@@ -172,50 +153,35 @@ class GetUserFriendsService:
             users_friends_association.c.second_id == user_id
         ))
 
-    def _format_friends_to_json(self, friends: list) -> list[dict]:
-        """Format friends list from DB to JSON"""
-        construct_lambda = lambda user: {
-            'id': user.id, 'email': user.email, 'nickname': user.nickname
-        }
-        return list(map(construct_lambda, friends))
-
-    async def get_friends(self, conn, user_id: Union[str, int]) -> list[dict]:
-        """Get user friends"""
+    async def get_friends_by_id(self, user_id: int) -> list[dict]:
+        """Get user friends using user id"""
         query = self._get_user_friends_query(user_id)
-        cursor = await conn.execute(query)
+        cursor = await self._conn.execute(query)
         user_friends = await cursor.fetchall()
-        json_user_friends = self._format_friends_to_json(user_friends)
-        return json_user_friends
+        json_friends = [
+            UserSerializer.parse_obj(dict(user)).dict() for user in user_friends
+        ]
+        return json_friends
 
-
-async def get_user_info(conn, user_id: Union[str, int]) -> dict:
-    """Get information (id, nickname, is_superuser, friends) about user"""
-    get_user_query = users.select().where(users.c.id == user_id)
-    cursor = await conn.execute(get_user_query)
-    user = await cursor.fetchone()
-    if not user: raise IndexError
-    json_user = {
-        'id': user.id, 'nickname': user.nickname,
-        'is_superuser': user.is_superuser
-    }
-    get_friends_service = GetUserFriendsService()
-    user_friends = await get_friends_service.get_friends(conn, user_id)
-    json_user['friends'] = user_friends
-    return json_user
+    async def get_friends_by_nick(self, user_nickname: str) -> list[dict]:
+        """Get user friends using user nickname"""
+        user = await get_user_by_nickname(self._conn, user_nickname)
+        friends = await self.get_friends_by_id(user.id)
+        return friends
 
 
 class GetAnotherUserInfoService:
 
-    def __init__(self, conn, current_user_id: Union[str, int]) -> None:
+    def __init__(self, conn, current_user_id: Union[str, int, None]) -> None:
         self._conn = conn
         self._current_user_id = current_user_id
 
-    async def get_info(self, another_user_id: Union[str, int]) -> dict:
+    async def get_info(self, another_user_nickname: str) -> dict:
         """Get full info (including friends and rating) about another user"""
-        user_info = await get_user_info(self._conn, another_user_id)
+        user_info = await get_user_info(self._conn, another_user_nickname)
         rating_service = GetUserRatingService(
             self._conn, self._current_user_id
         )
-        user_rating = await rating_service.get_user_rating(another_user_id)
+        user_rating = await rating_service.get_user_rating(user_info['id'])
         user_info['rating'] = user_rating
         return user_info

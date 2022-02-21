@@ -1,10 +1,12 @@
-from aiohttp.web import json_response, Response
+from aiohttp.web import json_response, Response, View
 from psycopg2.errors import UniqueViolation, ForeignKeyViolation
+from pydantic import ValidationError
 
 from .services import (
     RegistrationService, LoginService, get_all_users, add_user_friend,
     GetUserFriendsService, get_user_info, GetAnotherUserInfoService
 )
+from .serializers import RegistrationData, LoginData
 
 
 def user_required(func):
@@ -18,27 +20,51 @@ def user_required(func):
     return wrapper
 
 
-async def registration(request):
-    auth_data = await request.json()
-    async with request.app['db'].acquire() as conn:
-        service = RegistrationService()
+class RegistrationView(View):
+
+    async def _get_auth_data(self):
+        request_body = await self.request.text()
+        auth_data = RegistrationData.parse_raw(request_body)
+        return auth_data
+
+    async def _registrate_user(self, auth_data):
+        async with self.request.app['db'].acquire() as conn:
+            service = RegistrationService(conn)
+            response = await service.registrate_user(auth_data)
+            return response
+
+    async def post(self):
         try:
-            response = await service.registrate_user(conn, auth_data)
+            auth_data = await self._get_auth_data()
+            response = await self._registrate_user(auth_data)
+            return json_response(response)
+        except ValidationError as e:
+            return json_response(e.json(), status=400)
         except UniqueViolation:
             return json_response({'error': 'User already exists'}, status=400)
 
-    status = 200 if 'jwt_token' in response else 400
-    return json_response(response, status=status)
 
+class LoginView(View):
 
-async def login(request):
-    auth_data = await request.json()
-    async with request.app['db'].acquire() as conn:
-        service = LoginService()
-        response = await service.login_user(conn, auth_data)
+    async def _get_auth_data(self):
+        request_body = await self.request.text()
+        auth_data = LoginData.parse_raw(request_body)
+        return auth_data
 
-    status = 200 if 'jwt_token' in response else 400
-    return json_response(response, status=status)
+    async def _login_user(self, auth_data):
+        async with self.request.app['db'].acquire() as conn:
+            service = LoginService(conn)
+            response = await service.login_user(auth_data)
+            return response
+
+    async def post(self):
+        try:
+            auth_data = await self._get_auth_data()
+            response = await self._login_user(auth_data)
+            status = 200 if 'jwt_token' in response else 400
+            return json_response(response, status=status)
+        except ValidationError as e:
+            return json_response(e.json(), status=400)
 
 
 async def all_users(request):
@@ -66,15 +92,19 @@ async def add_friend(request):
 
 
 async def get_user_friends(request):
-    user_id = request.match_info['user_id']
-    service = GetUserFriendsService()
+    user_nickname = request.match_info['user_nickname']
     async with request.app['db'].acquire() as conn:
         try:
-            user_friends = await service.get_friends(conn, user_id)
+            service = GetUserFriendsService(conn)
+            user_friends = await service.get_friends_by_nick(user_nickname)
         except ForeignKeyViolation:
-            return json_response(
-                {'error': "User with this ID doesn't exist"}, status=400
-            )
+            return json_response({
+                'error': "User with this ID doesn't exist"
+            }, status=400)
+        except IndexError:
+            return json_response({
+                'error': 'There is no user with this nickname'
+            }, status=400)
 
     return json_response(user_friends)
 
@@ -82,21 +112,21 @@ async def get_user_friends(request):
 @user_required
 async def current_user_info(request):
     async with request.app['db'].acquire() as conn:
-        user_info = await get_user_info(conn, request.user['id'])
+        user_info = await get_user_info(conn, request.user['nickname'])
 
     return json_response(user_info)
 
 
 async def another_user_info(request):
-    current_user_id = request.user['id']
-    another_user_id = request.match_info['user_id']
+    current_user_id = request.user['id'] if request.user else None
+    another_user_nickname = request.match_info['user_nickname']
     async with request.app['db'].acquire() as conn:
         info_service = GetAnotherUserInfoService(conn, current_user_id)
         try:
-            another_user_info = await info_service.get_info(another_user_id)
+            user_info = await info_service.get_info(another_user_nickname)
         except IndexError:
-            return json_response(
-                {'error': "User with this ID doesn't exist"}, status=400
-            )
+            return json_response({
+                'error': 'There is no user with this nickname'
+            }, status=400)
 
-    return json_response(another_user_info)
+    return json_response(user_info)
