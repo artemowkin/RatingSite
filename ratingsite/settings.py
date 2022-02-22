@@ -9,7 +9,7 @@ config_path = BASE_DIR / 'config' / 'ratingsite.yaml'
 
 
 def get_config(path):
-    with open(config_path) as f:
+    with open(path) as f:
         config = yaml.safe_load(f)
 
     return config

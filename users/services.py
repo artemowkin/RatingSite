@@ -84,7 +84,7 @@ class RegistrationService:
             user_id: int) -> str:
         """Generate jwt token for user"""
         jwt_payload = auth_data.dict(include={'nickname', 'email'})
-        jwt_payload.update({'id': created_user_id})
+        jwt_payload.update({'id': user_id})
         jwt_token = jwt.encode(jwt_payload, config['jwt_secret'])
         return jwt_token
 
