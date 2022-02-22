@@ -69,6 +69,15 @@ class LoginView(View):
 
 
 async def all_users(request):
+    """
+    ---
+    description: Return all users
+    tags:
+    - users
+    responses:
+        "200":
+            description: successful operation
+    """
     async with request.app['db'].acquire() as conn:
         all_users = await get_all_users(conn, request.user)
 
