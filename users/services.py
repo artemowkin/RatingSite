@@ -1,10 +1,9 @@
-from typing import Optional, Union
-import re
+from typing import Union
 
 import jwt
 from passlib.hash import pbkdf2_sha256
 from aiohttp.web import Request
-from sqlalchemy import and_
+from sqlalchemy import and_, or_
 
 from ratingsite.settings import config
 from ratings.services import GetUserRatingService
@@ -21,7 +20,7 @@ async def get_user_by_nickname(conn, nickname: str):
     return user
 
 
-async def get_all_users(conn, current_user=None) -> dict:
+async def get_all_users(conn, current_user=None) -> list:
     """Get all users from DB exclude current user (if not empty)"""
     query = users.select().where(users.c.disabled == False)
     if current_user:
@@ -185,3 +184,36 @@ class GetAnotherUserInfoService:
         user_rating = await rating_service.get_user_rating(user_info['id'])
         user_info['rating'] = user_rating
         return user_info
+
+
+class SearchUsersService:
+    """Service to search users"""
+
+    def __init__(self, conn, current_user_id: Union[str, int, None]):
+        self._conn = conn
+        self._current_user_id = current_user_id
+
+    def _get_query(self, search_by: str):
+        like_exp = f"%{search_by}%"
+        query = users.select().where(or_(
+            users.c.nickname.ilike(like_exp),
+            users.c.first_name.ilike(like_exp),
+            users.c.last_name.ilike(like_exp)
+        ))
+        if self._current_user_id:
+            query = query.where(users.c.id != self._current_user_id)
+
+        return query
+
+    async def search(self, search_by: str) -> list[dict]:
+        """
+        Search users by query in nickname, first_name, last_name
+        fields
+        """
+        query = self._get_query(search_by)
+        cursor = await self._conn.execute(query)
+        users = await cursor.fetchall()
+        json_users = [
+            UserSerializer.parse_obj(dict(user)).dict() for user in users
+        ]
+        return json_users

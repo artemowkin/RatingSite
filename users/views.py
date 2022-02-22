@@ -4,7 +4,8 @@ from pydantic import ValidationError
 
 from .services import (
     RegistrationService, LoginService, get_all_users, add_user_friend,
-    GetUserFriendsService, get_user_info, GetAnotherUserInfoService
+    GetUserFriendsService, get_user_info, GetAnotherUserInfoService,
+    SearchUsersService
 )
 from .serializers import RegistrationData, LoginData
 
@@ -130,3 +131,12 @@ async def another_user_info(request):
             }, status=400)
 
     return json_response(user_info)
+
+
+async def search_users(request):
+    current_user_id = request.user['id'] if request.user else None
+    search_by = request.match_info['search_by']
+    async with request.app['db'].acquire() as conn:
+        search_service = SearchUsersService(conn, current_user_id)
+        users = await search_service.search(search_by)
+        return json_response(users)

@@ -11,5 +11,6 @@ def setup_users_routes(app):
         web.post('/api/v1/friends/add/', views.add_friend),
         web.get('/api/v1/friends/{user_nickname}/', views.get_user_friends),
         web.get('/api/v1/users/current/', views.current_user_info),
+        web.get('/api/v1/users/search/{search_by}/', views.search_users),
         web.get('/api/v1/users/{user_nickname}/', views.another_user_info),
     ])
